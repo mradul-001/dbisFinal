@@ -1,7 +1,7 @@
 import { useState } from 'react'
 
 function App() {
-  const [query, setQuery] = useState('SELECT * FROM users')
+  const [query, setQuery] = useState('')
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
