@@ -85,6 +85,27 @@ CREATE TABLE course (
     course_name VARCHAR(100),
     credits INT
 );
+
+CREATE TABLE extraone (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    age INT,
+    city VARCHAR(100)
+);
+
+CREATE TABLE extratwo (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    age INT,
+    city VARCHAR(100)
+);
+
+CREATE TABLE extrathree (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    age INT,
+    city VARCHAR(100)
+);
 "
 
 echo "==========================================="
