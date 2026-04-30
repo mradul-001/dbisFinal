@@ -83,130 +83,485 @@ static void lru_add(const char *table_name)
 
 static void smart_router_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-    if (!in_hook && queryDesc->sourceText && pg_strncasecmp(queryDesc->sourceText, "SELECT", 6) == 0)
+    if (!in_hook && queryDesc->sourceText)
     {
-        in_hook = true;
-        // Very basic prototype caching logic
-        elog(LOG, "Smart Router Hook Intercepted Query: %s", queryDesc->sourceText);
-        
-        char table_name[64] = {0};
-        const char *from_ptr = strstr(queryDesc->sourceText, "FROM ");
-        if (!from_ptr) from_ptr = strstr(queryDesc->sourceText, "from ");
-        if (!from_ptr) from_ptr = strstr(queryDesc->sourceText, "From ");
-        
-        if (from_ptr) {
-            from_ptr += 5; // Skip "FROM "
-            // Skip any spaces
-            while (*from_ptr == ' ' || *from_ptr == '\t' || *from_ptr == '\n') from_ptr++;
-            
-            int i = 0;
-            // Extract the table name until space, semicolon, newline, or max length
-            while (from_ptr[i] != '\0' && from_ptr[i] != ' ' && from_ptr[i] != ';' && from_ptr[i] != '\n' && from_ptr[i] != '\t' && i < 63) {
-                // Convert to lowercase to handle case-insensitivity of PG table names (assuming unquoted)
-                char c = from_ptr[i];
-                if (c >= 'A' && c <= 'Z') c = c + ('a' - 'A');
-                table_name[i] = c;
-                i++;
-            }
-            table_name[i] = '\0';
-        }
+        const char *query_text = queryDesc->sourceText;
+        bool is_select = pg_strncasecmp(query_text, "SELECT", 6) == 0;
+        bool is_insert = pg_strncasecmp(query_text, "INSERT", 6) == 0;
+        bool is_update = pg_strncasecmp(query_text, "UPDATE", 6) == 0;
+        bool is_delete = pg_strncasecmp(query_text, "DELETE", 6) == 0;
 
-        if (table_name[0] != '\0')
+        // ==============================================================
+        // ======================== SELECT HANDLER ======================
+        // ==============================================================
+        if (is_select)
         {
-            SPI_connect();
+            in_hook = true;
+            elog(LOG, "Smart Router: SELECT intercepted: %s", query_text);
 
-            int lru_idx = lru_find(table_name);
+            char table_name[64] = {0};
+            const char *from_ptr = strstr(query_text, "FROM ");
+            if (!from_ptr) from_ptr = strstr(query_text, "from ");
+            if (!from_ptr) from_ptr = strstr(query_text, "From ");
 
-            if (lru_idx >= 0)
+            if (from_ptr)
             {
-                /* ---- CACHE HIT (tracked in LRU) ---- */
-                lru_touch(lru_idx);
-                elog(LOG, "Smart Router: LRU cache hit for '%s'. [last_used refreshed to %ld]",
-                     table_name, lru_cache[lru_idx].last_used);
-            }
-            else
-            {
-                /*
-                 * Table not in LRU tracker.
-                 * Check if the local table already has rows
-                 * (e.g. data survived from a previous session after restart).
-                 */
-                char check_q[256];
-                snprintf(check_q, sizeof(check_q), "SELECT count(*) FROM %s", table_name);
-                int ret = SPI_execute(check_q, true, 0);
+                from_ptr += 5; // Skip "FROM "
+                while (*from_ptr == ' ' || *from_ptr == '\t' || *from_ptr == '\n') from_ptr++;
 
-                bool is_empty = true;
-                if (ret == SPI_OK_SELECT && SPI_processed > 0 && SPI_tuptable != NULL)
+                int i = 0;
+                while (from_ptr[i] != '\0' && from_ptr[i] != ' ' && from_ptr[i] != ';' &&
+                       from_ptr[i] != '\n' && from_ptr[i] != '\t' && i < 63)
                 {
-                    char *val = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-                    if (val && strcmp(val, "0") != 0)
-                        is_empty = false;
+                    char c = from_ptr[i];
+                    if (c >= 'A' && c <= 'Z') c = c + ('a' - 'A');
+                    table_name[i] = c;
+                    i++;
                 }
+                table_name[i] = '\0';
+            }
 
-                if (!is_empty)
+            if (table_name[0] != '\0')
+            {
+                SPI_connect();
+
+                int lru_idx = lru_find(table_name);
+
+                if (lru_idx >= 0)
                 {
-                    /* Local rows exist but weren't tracked (e.g. after restart) — re-register */
-                    elog(LOG, "Smart Router: '%s' has local data but wasn't in LRU. Re-registering.",
-                         table_name);
-                    lru_add(table_name);
+                    /* ---- CACHE HIT (tracked in LRU) ---- */
+                    lru_touch(lru_idx);
+                    elog(LOG, "Smart Router: LRU cache hit for '%s'. [last_used refreshed to %ld]",
+                         table_name, lru_cache[lru_idx].last_used);
                 }
                 else
                 {
-                    /* ---- CACHE MISS: fetch from remote, populate local, register in LRU ---- */
-                    elog(LOG, "Smart Router: Cache miss for '%s'. Fetching from remote...", table_name);
+                    /*
+                     * Table not in LRU tracker.
+                     * Check if the local table already has rows
+                     * (e.g. data survived from a previous session after restart).
+                     */
+                    char check_q[256];
+                    snprintf(check_q, sizeof(check_q), "SELECT count(*) FROM %s", table_name);
+                    int ret = SPI_execute(check_q, true, 0);
 
-                    PGconn *conn = PQconnectdb("host=127.0.0.1 port=6000 dbname=company_remote user=mradul");
-                    if (PQstatus(conn) == CONNECTION_OK)
+                    bool is_empty = true;
+                    if (ret == SPI_OK_SELECT && SPI_processed > 0 && SPI_tuptable != NULL)
                     {
-                        char fetch_all_query[256];
-                        snprintf(fetch_all_query, sizeof(fetch_all_query), "SELECT * FROM %s", table_name);
-                        PGresult *res = PQexec(conn, fetch_all_query);
+                        char *val = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+                        if (val && strcmp(val, "0") != 0)
+                            is_empty = false;
+                    }
 
-                        if (PQresultStatus(res) == PGRES_TUPLES_OK)
-                        {
-                            int rows = PQntuples(res);
-                            int cols = PQnfields(res);
-
-                            for (int i = 0; i < rows; i++)
-                            {
-                                StringInfoData insert_sql;
-                                initStringInfo(&insert_sql);
-                                appendStringInfo(&insert_sql, "INSERT INTO %s VALUES (", table_name);
-
-                                for (int j = 0; j < cols; j++)
-                                {
-                                    char *val = PQgetvalue(res, i, j);
-                                    if (j > 0) appendStringInfoString(&insert_sql, ", ");
-                                    appendStringInfo(&insert_sql, "'%s'", val);
-                                }
-                                appendStringInfoString(&insert_sql, ")");
-                                SPI_execute(insert_sql.data, false, 0);
-                            }
-                            elog(LOG, "Smart Router: Cached %d rows for '%s'.", rows, table_name);
-
-                            /* Register the newly populated table in LRU */
-                            lru_add(table_name);
-
-                            /* Make inserted rows visible to the current query */
-                            CommandCounterIncrement();
-                            if (queryDesc->snapshot)
-                                queryDesc->snapshot->curcid = GetCurrentCommandId(false);
-                        }
-                        PQclear(res);
+                    if (!is_empty)
+                    {
+                        /* Local rows exist but weren't tracked (e.g. after restart) — re-register */
+                        elog(LOG, "Smart Router: '%s' has local data but wasn't in LRU. Re-registering.",
+                             table_name);
+                        lru_add(table_name);
                     }
                     else
                     {
-                        elog(WARNING, "Smart Router: Could not connect to remote for cache miss on '%s': %s",
-                             table_name, PQerrorMessage(conn));
+                        /* ---- CACHE MISS: fetch from remote, populate local, register in LRU ---- */
+                        elog(LOG, "Smart Router: Cache miss for '%s'. Fetching from remote...", table_name);
+
+                        PGconn *conn = PQconnectdb("host=127.0.0.1 port=6000 dbname=company_remote user=mradul");
+                        if (PQstatus(conn) == CONNECTION_OK)
+                        {
+                            char fetch_all_query[256];
+                            snprintf(fetch_all_query, sizeof(fetch_all_query), "SELECT * FROM %s", table_name);
+                            PGresult *res = PQexec(conn, fetch_all_query);
+
+                            if (PQresultStatus(res) == PGRES_TUPLES_OK)
+                            {
+                                int rows = PQntuples(res);
+                                int cols = PQnfields(res);
+
+                                for (int i = 0; i < rows; i++)
+                                {
+                                    StringInfoData insert_sql;
+                                    initStringInfo(&insert_sql);
+                                    appendStringInfo(&insert_sql, "INSERT INTO %s VALUES (", table_name);
+
+                                    for (int j = 0; j < cols; j++)
+                                    {
+                                        char *val = PQgetvalue(res, i, j);
+                                        if (j > 0) appendStringInfoString(&insert_sql, ", ");
+                                        appendStringInfo(&insert_sql, "'%s'", val);
+                                    }
+                                    appendStringInfoString(&insert_sql, ")");
+                                    SPI_execute(insert_sql.data, false, 0);
+                                }
+                                elog(LOG, "Smart Router: Cached %d rows for '%s'.", rows, table_name);
+
+                                /* Register the newly populated table in LRU */
+                                lru_add(table_name);
+
+                                /* Make inserted rows visible to the current query */
+                                CommandCounterIncrement();
+                                if (queryDesc->snapshot)
+                                    queryDesc->snapshot->curcid = GetCurrentCommandId(false);
+                            }
+                            PQclear(res);
+                        }
+                        else
+                        {
+                            elog(WARNING, "Smart Router: Could not connect to remote for cache miss on '%s': %s",
+                                 table_name, PQerrorMessage(conn));
+                        }
+                        PQfinish(conn);
                     }
-                    PQfinish(conn);
                 }
+
+                SPI_finish();
             }
 
-            SPI_finish();
+            in_hook = false;
         }
-        
-        in_hook = false;
+
+        // ==============================================================
+        // ======================== INSERT HANDLER ======================
+        // ==============================================================
+        else if (is_insert)
+        {
+            in_hook = true;
+            elog(LOG, "Smart Router: INSERT intercepted: %s", query_text);
+
+            /* --- Parse table name from "INSERT INTO <table>" --- */
+            char table_name[64] = {0};
+            const char *into_ptr = strcasestr(query_text, "INTO ");
+            if (into_ptr)
+            {
+                into_ptr += 5;
+                while (*into_ptr == ' ' || *into_ptr == '\t') into_ptr++;
+
+                int i = 0;
+                while (into_ptr[i] != '\0' && into_ptr[i] != ' ' &&
+                       into_ptr[i] != '(' && into_ptr[i] != '\n' &&
+                       into_ptr[i] != '\t' && i < 63)
+                {
+                    char c = into_ptr[i];
+                    if (c >= 'A' && c <= 'Z') c = c + ('a' - 'A');
+                    table_name[i] = c;
+                    i++;
+                }
+                table_name[i] = '\0';
+            }
+
+            if (table_name[0] != '\0')
+            {
+                elog(LOG, "Smart Router: INSERT targeting table '%s'. Writing to remote first...",
+                     table_name);
+
+                /* --- Step 1: Write to remote (source of truth) --- */
+                PGconn *conn = PQconnectdb(
+                    "host=127.0.0.1 port=6000 dbname=company_remote user=mradul");
+
+                if (PQstatus(conn) != CONNECTION_OK)
+                {
+                    /*
+                     * Remote is unreachable — abort entirely.
+                     * We must NOT allow a local insert that would make
+                     * the cache inconsistent with the remote master.
+                     */
+                    elog(ERROR,
+                         "Smart Router: Remote connection failed during INSERT on '%s': %s. "
+                         "Aborting to preserve consistency.",
+                         table_name, PQerrorMessage(conn));
+                    PQfinish(conn);
+                    in_hook = false;
+                    ereport(ERROR,
+                            (errcode(ERRCODE_CONNECTION_FAILURE),
+                             errmsg("Smart Router: Could not reach remote master. INSERT aborted.")));
+                }
+
+                PGresult *res = PQexec(conn, query_text);
+                ExecStatusType status = PQresultStatus(res);
+
+                if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK)
+                {
+                    /*
+                     * Remote rejected the insert (constraint violation, type mismatch, etc.)
+                     * Suppress the local insert to keep both sides in sync.
+                     */
+                    elog(ERROR,
+                         "Smart Router: Remote INSERT failed for '%s': %s. "
+                         "Suppressing local insert.",
+                         table_name, PQresultErrorMessage(res));
+                    PQclear(res);
+                    PQfinish(conn);
+                    in_hook = false;
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INTERNAL_ERROR),
+                             errmsg("Smart Router: Remote INSERT failed. Local cache not modified.")));
+                }
+
+                elog(LOG, "Smart Router: Remote INSERT succeeded for '%s'. Updating LRU and proceeding locally...",
+                     table_name);
+                PQclear(res);
+                PQfinish(conn);
+
+                /* --- Step 2: Update LRU tracking --- */
+                SPI_connect();
+
+                int lru_idx = lru_find(table_name);
+                if (lru_idx >= 0)
+                {
+                    /*
+                     * Table already in local cache — just refresh its recency.
+                     * The actual local row insert happens via the standard hook chain below.
+                     */
+                    lru_touch(lru_idx);
+                    elog(LOG, "Smart Router: LRU touched for '%s' after INSERT. [%d/%d slots used]",
+                         table_name, lru_count, CACHE_MAX_TABLES);
+                }
+                else
+                {
+                    /*
+                     * Table not yet tracked in LRU — this INSERT naturally
+                     * warms up the cache for future SELECTs on this table.
+                     */
+                    elog(LOG, "Smart Router: '%s' not in LRU. Registering after INSERT warm-up.",
+                         table_name);
+                    lru_add(table_name);
+                }
+
+                SPI_finish();
+
+                /* Step 3: Fall through to standard execution below — local insert proceeds normally */
+                elog(LOG, "Smart Router: Proceeding with local INSERT for '%s'.", table_name);
+            }
+
+            in_hook = false;
+        }
+
+        // ==============================================================
+        // ======================== UPDATE HANDLER ======================
+        // ==============================================================
+        else if (is_update)
+        {
+            in_hook = true;
+            elog(LOG, "Smart Router: UPDATE intercepted: %s", query_text);
+
+            /* --- Parse table name from "UPDATE <table> SET" --- */
+            char table_name[64] = {0};
+            const char *update_ptr = strcasestr(query_text, "UPDATE ");
+            if (update_ptr)
+            {
+                update_ptr += 7;
+                while (*update_ptr == ' ' || *update_ptr == '\t') update_ptr++;
+
+                int i = 0;
+                while (update_ptr[i] != '\0' && update_ptr[i] != ' ' &&
+                       update_ptr[i] != '\n'  && update_ptr[i] != '\t' && i < 63)
+                {
+                    char c = update_ptr[i];
+                    if (c >= 'A' && c <= 'Z') c = c + ('a' - 'A');
+                    table_name[i] = c;
+                    i++;
+                }
+                table_name[i] = '\0';
+            }
+
+            if (table_name[0] != '\0')
+            {
+                elog(LOG, "Smart Router: UPDATE targeting table '%s'. Writing to remote first...",
+                     table_name);
+
+                /* --- Step 1: Execute on remote first --- */
+                PGconn *conn = PQconnectdb(
+                    "host=127.0.0.1 port=6000 dbname=company_remote user=mradul");
+
+                if (PQstatus(conn) != CONNECTION_OK)
+                {
+                    elog(ERROR,
+                         "Smart Router: Remote connection failed during UPDATE on '%s': %s. "
+                         "Aborting to preserve consistency.",
+                         table_name, PQerrorMessage(conn));
+                    PQfinish(conn);
+                    in_hook = false;
+                    ereport(ERROR,
+                            (errcode(ERRCODE_CONNECTION_FAILURE),
+                             errmsg("Smart Router: Could not reach remote master. UPDATE aborted.")));
+                }
+
+                PGresult *res = PQexec(conn, query_text);
+                ExecStatusType status = PQresultStatus(res);
+
+                if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK)
+                {
+                    /*
+                     * Remote rejected the update — suppress local execution
+                     * so both sides remain consistent.
+                     */
+                    elog(ERROR,
+                         "Smart Router: Remote UPDATE failed for '%s': %s. "
+                         "Suppressing local update.",
+                         table_name, PQresultErrorMessage(res));
+                    PQclear(res);
+                    PQfinish(conn);
+                    in_hook = false;
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INTERNAL_ERROR),
+                             errmsg("Smart Router: Remote UPDATE failed. Local cache not modified.")));
+                }
+
+                elog(LOG, "Smart Router: Remote UPDATE succeeded for '%s'. Proceeding with local update...",
+                     table_name);
+                PQclear(res);
+                PQfinish(conn);
+
+                /* --- Step 2: Update LRU tracking ---
+                 * UPDATE implies the table is actively used — touch if cached,
+                 * but do NOT auto-add if not cached (UPDATE alone is not a warm-up). */
+                SPI_connect();
+                int lru_idx = lru_find(table_name);
+                if (lru_idx >= 0)
+                {
+                    lru_touch(lru_idx);
+                    elog(LOG, "Smart Router: LRU touched for '%s' after UPDATE. [%d/%d slots used]",
+                         table_name, lru_count, CACHE_MAX_TABLES);
+                }
+                else
+                {
+                    /*
+                     * Table not in local cache — local UPDATE will apply to an
+                     * empty table which is harmless (0 rows affected).
+                     * We still let it fall through so PG doesn't error out.
+                     */
+                    elog(LOG, "Smart Router: '%s' not in LRU cache. Local UPDATE will be a no-op on empty table.",
+                         table_name);
+                }
+                SPI_finish();
+
+                /* Step 3: Fall through — local UPDATE runs via standard hook chain */
+                elog(LOG, "Smart Router: Proceeding with local UPDATE for '%s'.", table_name);
+            }
+
+            in_hook = false;
+        }
+
+        // ==============================================================
+        // ======================== DELETE HANDLER ======================
+        // ==============================================================
+        else if (is_delete)
+        {
+            in_hook = true;
+            elog(LOG, "Smart Router: DELETE intercepted: %s", query_text);
+
+            /* --- Parse table name from "DELETE FROM <table>" --- */
+            char table_name[64] = {0};
+            const char *from_ptr = strcasestr(query_text, "FROM ");
+            if (from_ptr)
+            {
+                from_ptr += 5;
+                while (*from_ptr == ' ' || *from_ptr == '\t') from_ptr++;
+
+                int i = 0;
+                while (from_ptr[i] != '\0' && from_ptr[i] != ' ' &&
+                       from_ptr[i] != '\n'  && from_ptr[i] != '\t' &&
+                       from_ptr[i] != ';'   && i < 63)
+                {
+                    char c = from_ptr[i];
+                    if (c >= 'A' && c <= 'Z') c = c + ('a' - 'A');
+                    table_name[i] = c;
+                    i++;
+                }
+                table_name[i] = '\0';
+            }
+
+            if (table_name[0] != '\0')
+            {
+                elog(LOG, "Smart Router: DELETE targeting table '%s'. Writing to remote first...",
+                     table_name);
+
+                /* --- Step 1: Execute on remote first --- */
+                PGconn *conn = PQconnectdb(
+                    "host=127.0.0.1 port=6000 dbname=company_remote user=mradul");
+
+                if (PQstatus(conn) != CONNECTION_OK)
+                {
+                    elog(ERROR,
+                         "Smart Router: Remote connection failed during DELETE on '%s': %s. "
+                         "Aborting to preserve consistency.",
+                         table_name, PQerrorMessage(conn));
+                    PQfinish(conn);
+                    in_hook = false;
+                    ereport(ERROR,
+                            (errcode(ERRCODE_CONNECTION_FAILURE),
+                             errmsg("Smart Router: Could not reach remote master. DELETE aborted.")));
+                }
+
+                PGresult *res = PQexec(conn, query_text);
+                ExecStatusType status = PQresultStatus(res);
+
+                if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK)
+                {
+                    /*
+                     * Remote rejected the delete — suppress local execution
+                     * so both sides remain consistent.
+                     */
+                    elog(ERROR,
+                         "Smart Router: Remote DELETE failed for '%s': %s. "
+                         "Suppressing local delete.",
+                         table_name, PQresultErrorMessage(res));
+                    PQclear(res);
+                    PQfinish(conn);
+                    in_hook = false;
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INTERNAL_ERROR),
+                             errmsg("Smart Router: Remote DELETE failed. Local cache not modified.")));
+                }
+
+                elog(LOG, "Smart Router: Remote DELETE succeeded for '%s'. Proceeding with local delete...",
+                     table_name);
+                PQclear(res);
+                PQfinish(conn);
+
+                /* --- Step 2: Update LRU tracking ---
+                 * If this is a full-table DELETE (no WHERE clause), the table
+                 * is now empty — remove it from LRU so the next SELECT re-fetches
+                 * cleanly. If it's a partial DELETE (has WHERE), just touch it. */
+                SPI_connect();
+                int lru_idx = lru_find(table_name);
+
+                bool is_full_delete = (strcasestr(query_text, "WHERE") == NULL);
+
+                if (lru_idx >= 0)
+                {
+                    if (is_full_delete)
+                    {
+                        /*
+                         * Entire table wiped — evict from LRU so the next SELECT
+                         * triggers a fresh fetch from remote instead of seeing an
+                         * empty local table.
+                         */
+                        elog(LOG, "Smart Router: Full DELETE on '%s'. Removing from LRU cache. [%d/%d slots used]",
+                             table_name, lru_count - 1, CACHE_MAX_TABLES);
+                        lru_cache[lru_idx] = lru_cache[lru_count - 1];
+                        lru_count--;
+                    }
+                    else
+                    {
+                        /* Partial DELETE — table still has rows, just refresh recency */
+                        lru_touch(lru_idx);
+                        elog(LOG, "Smart Router: Partial DELETE on '%s'. LRU touched. [%d/%d slots used]",
+                             table_name, lru_count, CACHE_MAX_TABLES);
+                    }
+                }
+                else
+                {
+                    elog(LOG, "Smart Router: '%s' not in LRU cache. Local DELETE will be a no-op on empty table.",
+                         table_name);
+                }
+                SPI_finish();
+
+                /* Step 3: Fall through — local DELETE runs via standard hook chain */
+                elog(LOG, "Smart Router: Proceeding with local DELETE for '%s'.", table_name);
+            }
+
+            in_hook = false;
+        }
     }
 
     if (prev_ExecutorStart)
