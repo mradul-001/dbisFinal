@@ -1,0 +1,5 @@
+# smart_router extension
+comment = 'Smart DB Router and Cacher'
+default_version = '1.0'
+module_pathname = '$libdir/smart_router'
+relocatable = true
