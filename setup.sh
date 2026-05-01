@@ -46,10 +46,7 @@ mkdir -p "$CLUSTERS_DIR/local"
 echo "========================================="
 echo "=== Phase 4: Configuring Clusters ==="
 echo "========================================="
-# Configure remote master
 echo "port = 6000" >> "$CLUSTERS_DIR/remote/postgresql.conf"
-
-# Configure local middleware
 echo "port = 6001" >> "$CLUSTERS_DIR/local/postgresql.conf"
 echo "shared_preload_libraries = 'smart_router'" >> "$CLUSTERS_DIR/local/postgresql.conf"
 
@@ -58,12 +55,9 @@ echo "=== Phase 5: Starting Remote Cluster and Seeding Data ==="
 echo "==========================================================="
 "$PG_BUILD_DIR/bin/pg_ctl" start -D "$CLUSTERS_DIR/remote" -l "$CLUSTERS_DIR/remote/server.log"
 
-# Wait a few seconds to ensure the remote cluster is fully ready to accept connections
 sleep 3
 
 "$PG_BUILD_DIR/bin/createdb" -h 127.0.0.1 -p 6000 company_remote
-
-# Create generic tables but leave them completely empty as requested
 "$PG_BUILD_DIR/bin/psql" -h 127.0.0.1 -p 6000 -d company_remote -c "
 CREATE TABLE student (
     id SERIAL PRIMARY KEY,
@@ -111,7 +105,6 @@ CREATE TABLE extrathree (
 echo "==========================================="
 echo "=== Phase 6: Starting Local Cluster ==="
 echo "==========================================="
-# This will trigger the smart_router background worker to pre-scaffold the local DB
 "$PG_BUILD_DIR/bin/pg_ctl" start -D "$CLUSTERS_DIR/local" -l "$CLUSTERS_DIR/local/server.log"
 
 echo "=============================================================="
@@ -119,7 +112,6 @@ echo "=== Phase 7: Installing Frontend and Backend Node Modules ==="
 echo "=============================================================="
 cd "$ROOT_DIR/pg_custom_dashboard/db-middleware-api"
 npm install
-
 cd "$ROOT_DIR/pg_custom_dashboard/db-dashboard"
 npm install
 

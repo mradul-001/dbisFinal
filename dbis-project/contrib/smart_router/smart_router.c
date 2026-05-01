@@ -48,7 +48,6 @@ static void lru_touch(int idx)
     lru_cache[idx].last_used = ++lru_clock;
 }
 
-/* Evicts the least recently used table: deletes its rows and removes it from the tracker */
 static void lru_evict(void)
 {
     int min_idx = 0;
@@ -62,7 +61,6 @@ static void lru_evict(void)
          lru_cache[min_idx].table_name, lru_cache[min_idx].last_used);
     SPI_execute(evict_sql, false, 0);
 
-    /* Compact the array */
     lru_cache[min_idx] = lru_cache[lru_count - 1];
     lru_count--;
 }
@@ -85,12 +83,6 @@ static void lru_add(const char *table_name)
 // ------------------------------------------------------------------
 // -------------------- JOIN Helper Functions -----------------------
 
-/*
- * extract_join_tables:
- * Walks the query string and collects every real table name that appears
- * after a FROM or JOIN keyword. Returns the count of tables found.
- * Results are stored in tables[][64]; extraction stops at max_tables.
- */
 #define MAX_JOIN_TABLES 16
 
 static int extract_join_tables(const char *query_text, char tables[][64], int max_tables)
@@ -122,7 +114,6 @@ static int extract_join_tables(const char *query_text, char tables[][64], int ma
             }
             tables[count][i] = '\0';
 
-            /* Skip SQL keywords mistakenly captured as table names */
             if (tables[count][0] != '\0'                    &&
                 pg_strcasecmp(tables[count], "select") != 0 &&
                 pg_strcasecmp(tables[count], "on")     != 0 &&
@@ -141,14 +132,6 @@ static int extract_join_tables(const char *query_text, char tables[][64], int ma
     return count;
 }
 
-/*
- * fetch_table_into_cache:
- * Connects to remote, fetches all rows of table_name, inserts them
- * locally via SPI, and registers the table in the LRU.
- *
- * Caller MUST have already called SPI_connect().
- * Returns true on success, false on any remote failure.
- */
 static bool fetch_table_into_cache(const char *table_name)
 {
     PGconn *conn = PQconnectdb(
@@ -201,24 +184,6 @@ static bool fetch_table_into_cache(const char *table_name)
     return true;
 }
 
-/*
- * run_join_on_remote:
- * Called ONLY in the overflow case (JOIN tables > CACHE_MAX_TABLES).
- *
- * Executes the full JOIN query on the remote master via libpq and stages
- * all result rows into a local session-scoped temporary table named
- * _sr_remote_result. The columns are inferred from the remote result set
- * and typed as TEXT (sufficient for a prototype).
- *
- * The client can then retrieve results with:
- *     SELECT * FROM _sr_remote_result;
- *
- * In a production implementation this would rewrite the query plan
- * in-place rather than using a staging table.
- *
- * Caller MUST have already called SPI_connect().
- * Returns true on success, false on any remote failure.
- */
 static bool run_join_on_remote(const char *query_text, QueryDesc *queryDesc)
 {
     elog(LOG, "Smart Router JOIN OVERFLOW: Executing full JOIN on remote master...");
@@ -252,8 +217,6 @@ static bool run_join_on_remote(const char *query_text, QueryDesc *queryDesc)
 
     /*
      * Build a temp table whose columns match the remote result set.
-     * All columns are TEXT to keep the prototype simple.
-     * TEMP tables are session-scoped and cleaned up automatically.
      */
     StringInfoData create_sql;
     initStringInfo(&create_sql);
@@ -267,7 +230,6 @@ static bool run_join_on_remote(const char *query_text, QueryDesc *queryDesc)
     appendStringInfoString(&create_sql, ")");
     SPI_execute(create_sql.data, false, 0);
 
-    /* Clear any stale rows from a previous overflow query this session */
     SPI_execute("DELETE FROM _sr_remote_result", false, 0);
 
     /* Stage all remote rows locally */
@@ -321,9 +283,6 @@ static void smart_router_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
             if (is_join)
             {
-                // ------------------------------------------------------
-                // JOIN path
-                // ------------------------------------------------------
                 char join_tables[MAX_JOIN_TABLES][64];
                 int  table_count = extract_join_tables(
                     query_text, join_tables, MAX_JOIN_TABLES);
@@ -333,13 +292,7 @@ static void smart_router_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
                 SPI_connect();
 
-                // ======================================================
                 // OVERFLOW CHECK
-                // If the JOIN spans more tables than CACHE_MAX_TABLES,
-                // we cannot cache all of them at the same time.
-                // Route the entire JOIN to the remote master and stage
-                // results in the local temp table _sr_remote_result.
-                // ======================================================
                 if (table_count > CACHE_MAX_TABLES)
                 {
                     elog(WARNING,
@@ -359,22 +312,14 @@ static void smart_router_ExecutorStart(QueryDesc *queryDesc, int eflags)
                              "Smart Router JOIN OVERFLOW: Remote execution failed. "
                              "Query results will be empty.");
 
-                    /*
-                     * LRU is intentionally untouched — overflow tables are NOT
-                     * being cached, so cache state must stay consistent.
-                     */
+                    //  LRU is intentionally untouched — overflow tables are NOT
+                    //  being cached, so cache state must stay consistent.
                     SPI_finish();
                     in_hook = false;
-                    /* Fall through to standard executor — runs locally (empty tables),
-                     * correct data lives in _sr_remote_result. */
                 }
                 else
                 {
-                    // --------------------------------------------------
                     // Normal JOIN (table_count <= CACHE_MAX_TABLES):
-                    // Cache-miss tables are fetched individually, then
-                    // the JOIN runs fully against the local cache.
-                    // --------------------------------------------------
                     bool all_ok = true;
 
                     for (int t = 0; t < table_count; t++)
@@ -390,7 +335,6 @@ static void smart_router_ExecutorStart(QueryDesc *queryDesc, int eflags)
                         }
                         else
                         {
-                            /* Check for local rows (post-restart survival) */
                             char check_q[256];
                             snprintf(check_q, sizeof(check_q),
                                      "SELECT count(*) FROM %s", tname);
@@ -725,7 +669,6 @@ static void smart_router_ExecutorStart(QueryDesc *queryDesc, int eflags)
                 PQclear(res);
                 PQfinish(conn);
 
-                /* Touch if cached; do NOT auto-add — UPDATE alone is not a warm-up. */
                 SPI_connect();
                 int lru_idx = lru_find(table_name);
                 if (lru_idx >= 0)
@@ -811,11 +754,6 @@ static void smart_router_ExecutorStart(QueryDesc *queryDesc, int eflags)
                 PQclear(res);
                 PQfinish(conn);
 
-                /*
-                 * Full DELETE (no WHERE) → evict from LRU so the next SELECT
-                 *   re-fetches instead of seeing a stale empty table.
-                 * Partial DELETE (has WHERE) → touch (table still has rows).
-                 */
                 SPI_connect();
                 int lru_idx = lru_find(table_name);
                 bool is_full_delete = (strcasestr(query_text, "WHERE") == NULL);
@@ -862,7 +800,6 @@ static void smart_router_ExecutorStart(QueryDesc *queryDesc, int eflags)
 void _PG_init(void)
 {
     BackgroundWorker worker;
-
     MemSet(&worker, 0, sizeof(BackgroundWorker));
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
@@ -872,9 +809,7 @@ void _PG_init(void)
     sprintf(worker.bgw_name, "Smart Router Schema Synchronizer");
     sprintf(worker.bgw_type, "smart_router");
     worker.bgw_main_arg = (Datum)0;
-
     RegisterBackgroundWorker(&worker);
-
     prev_ExecutorStart = ExecutorStart_hook;
     ExecutorStart_hook = smart_router_ExecutorStart;
 }

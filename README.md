@@ -1,0 +1,3 @@
+- Run ./setup.sh
+- cd pg_custom_dashboard/db-dashboard; npm run dev;
+- cd pg_custom_dashboard/db-middleware-api; node server.js
